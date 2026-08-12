@@ -1,4 +1,4 @@
-import argparse, os, sys, json, time, math, torch, threading, queue, base64, io, logging, contextlib
+import argparse, os, sys, json, time, math, torch, threading, queue, base64, io, logging, contextlib, wave
 import numpy as np
 import torchaudio
 from flask import Flask, request, Response, send_from_directory
@@ -21,6 +21,7 @@ sock = Sock(app)
 M = {}  # model / tokenizer / device / mimi / asr / cfg
 V = {}  # voice_name -> {ref_codes, spk_emb}
 V_builtin, V_unseen, V_manual = [], [], []
+VOICE_PREVIEW_CACHE = {}  # voice_name -> WAV bytes
 MODEL_LOCK = threading.Lock()
 SAMPLES_PER_FRAME = 1920
 REF_FRAMES = 300
@@ -106,7 +107,40 @@ def voice_args(name):
         return {'ref_codes': rc, 'spk_emb': se}
     return {}
 
+def voice_preview_wav(name):
+    cacheable = name not in V_manual
+    if cacheable:
+        cached = VOICE_PREVIEW_CACHE.get(name)
+        if cached is not None:
+            return cached
+    with MODEL_LOCK, torch.inference_mode():
+        if cacheable:
+            cached = VOICE_PREVIEW_CACHE.get(name)
+            if cached is not None:
+                return cached
+        mimi = M.get('mimi')
+        if mimi is None:
+            raise RuntimeError('Mimi model is unavailable')
+        ref_codes = V[name].get('ref_codes')
+        if ref_codes is None or ref_codes.ndim != 2 or ref_codes.shape[0] != 8 or ref_codes.shape[1] == 0:
+            raise RuntimeError('Voice reference codes are invalid')
+        codes = ref_codes.unsqueeze(0).to(device=M['device'], dtype=torch.long)
+        codes = torch.where(codes >= 2049, torch.zeros_like(codes), codes)
+        audio = mimi.decode(codes).audio_values.detach().float().cpu().numpy().reshape(-1)
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype('<i2').tobytes()
+        out = io.BytesIO()
+        with wave.open(out, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(pcm)
+        data = out.getvalue()
+        if cacheable:
+            VOICE_PREVIEW_CACHE[name] = data
+        return data
+
 def register_voice(name, value, group='manual'):
+    VOICE_PREVIEW_CACHE.pop(name, None)
     V[name] = value
     groups = {'builtin': V_builtin, 'unseen': V_unseen, 'manual': V_manual}
     dst = groups[group]
@@ -128,6 +162,7 @@ def delete_manual_voice(name):
         saved.pop(name)
         torch.save(saved, out_path)
     V.pop(name, None)
+    VOICE_PREVIEW_CACHE.pop(name, None)
     if name in V_manual:
         V_manual.remove(name)
 
@@ -229,10 +264,9 @@ def prepare_turn(text, samples, image_b64, do_asr_for_image):
             prompt = user_text
         else:
             audio_inputs, audio_lens, prompt = prep_audio(samples)
-            if M['cfg'].max_history_turns > 0:
-                sa = samples.copy()
-                def _a(): asr_result[0] = asr_run(sa)
-                asr_thread = threading.Thread(target=_a); asr_thread.start()
+            sa = samples.copy()
+            def _a(): asr_result[0] = asr_run(sa)
+            asr_thread = threading.Thread(target=_a); asr_thread.start()
     if image_b64:
         pixel_values = prep_image(image_b64)
         m = M['model']
@@ -248,6 +282,25 @@ def call_page(): return send_from_directory('.', 'web_demo.html')
 @app.route('/voices')
 def get_voices():
     return json.dumps({'builtin': sorted(V_builtin), 'unseen': sorted(V_unseen), 'manual': sorted(V_manual)})
+
+@app.route('/voices/<name>/preview')
+def preview_voice(name):
+    if name == 'default':
+        return Response(json.dumps({'ok': False, 'error': 'default voice has no reference preview'}), status=400, mimetype='application/json')
+    if name not in V:
+        return Response(json.dumps({'ok': False, 'error': 'unknown voice'}), status=404, mimetype='application/json')
+    if M.get('mimi') is None:
+        return Response(json.dumps({'ok': False, 'error': 'Mimi model is unavailable'}), status=503, mimetype='application/json')
+    try:
+        data = voice_preview_wav(name)
+        cache_control = 'private, no-store' if name in V_manual else 'private, max-age=3600'
+        return Response(data, mimetype='audio/wav', headers={
+            'Cache-Control': cache_control,
+            'Content-Length': str(len(data)),
+            'X-Content-Type-Options': 'nosniff',
+        })
+    except Exception as e:
+        return Response(json.dumps({'ok': False, 'error': str(e)}), status=500, mimetype='application/json')
 
 @app.route('/models')
 def get_models():
@@ -413,10 +466,14 @@ def realtime(ws):
             x = build_ids(prompt, state['history'])
             va_rt = voice_args(state.get('voice', 'default'))
 
-            frames, full_text, interrupted = [], '', False
+            frames, full_text, interrupted, asr_sent = [], '', False, False
             for y, af in run_generate(x, audio_inputs, audio_lens, pixel_values,
                                        max_new_tokens=512, temperature=0.7, **va_rt):
                 if poll_interrupt() or session.interrupt: interrupted = True; break
+                if not asr_sent and asr_th and not asr_th.is_alive():
+                    asr_th.join(); user_text = asr_res[0] or user_text
+                    if user_text: ws.send(json.dumps({'type': 'user_prompt', 'content': user_text}))
+                    asr_sent = True
                 if y is not None:
                     ans = M['tokenizer'].decode(y[0].tolist(), skip_special_tokens=True)
                     if ans and ans[-1] != '\ufffd' and len(ans) > len(full_text):
@@ -428,8 +485,9 @@ def realtime(ws):
             if not interrupted:
                 for pcm in stream_pcm(frames, flush=True):
                     ws.send(json.dumps({'type': 'pcm', 'data': base64.b64encode(pcm).decode()}))
-            if asr_th:
+            if asr_th and not asr_sent:
                 asr_th.join(); user_text = asr_res[0] or user_text
+                if user_text: ws.send(json.dumps({'type': 'user_prompt', 'content': user_text}))
             if n_hist > 0:
                 if user_text: state['history'].append({'role': 'user', 'content': user_text})
                 if full_text: state['history'].append({'role': 'assistant', 'content': full_text})

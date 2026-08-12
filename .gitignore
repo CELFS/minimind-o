@@ -5,4 +5,13 @@ __pycache__/
 .cursor/
 .claude/
 .specstory/
+.conda-env/
+.cache/
 .env
+
+runtime-models/
+model/SenseVoiceSmall/
+model/mimi/
+model/siglip2-base-p32-256-ve/
+model/campplus/
+out/
