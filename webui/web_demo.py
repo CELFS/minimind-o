@@ -23,6 +23,12 @@ WEBUI_DIR = os.path.join(ROOT_DIR, 'webui')
 MODEL_DIR = os.path.join(ROOT_DIR, 'model')
 ORIGIN_SERVICE_TOKEN = os.environ.get('ORIGIN_SERVICE_TOKEN', '').strip()
 REQUIRE_ORIGIN_AUTH = os.environ.get('REQUIRE_ORIGIN_AUTH', '0') == '1'
+VAD_THRESHOLD = float(os.environ.get('VAD_THRESHOLD', '0.7'))
+VAD_PRE_SPEECH_MS = int(os.environ.get('VAD_PRE_SPEECH_MS', '512'))
+if not 0 <= VAD_THRESHOLD <= 1:
+    raise ValueError('VAD_THRESHOLD 必须在 0 到 1 之间')
+if VAD_PRE_SPEECH_MS < 0:
+    raise ValueError('VAD_PRE_SPEECH_MS 不能小于 0')
 M = {}  # model / tokenizer / device / mimi / asr / cfg
 V = {}  # voice_name -> {ref_codes, spk_emb}
 V_builtin, V_unseen, V_manual = [], [], []
@@ -277,7 +283,7 @@ def load_main_model(model_path, model_name):
         print(f'Loaded model: {model_name} ({params:.2f}M)')
         return round(params, 2)
 
-def prepare_turn(text, samples, image_b64, do_asr_for_image):
+def prepare_turn(text, samples, image_b64, do_asr_for_image, known_user_text=None):
     """返回 (audio_inputs, audio_lens, pixel_values, prompt_for_model, user_text_for_history, asr_thread, asr_result)"""
     audio_inputs = audio_lens = pixel_values = None
     prompt = text or ''
@@ -285,13 +291,16 @@ def prepare_turn(text, samples, image_b64, do_asr_for_image):
     asr_thread, asr_result = None, [None]
     if samples is not None:
         if image_b64 and do_asr_for_image:
-            user_text = asr_run(samples)
+            user_text = known_user_text if known_user_text is not None else asr_run(samples)
             prompt = user_text
         else:
             audio_inputs, audio_lens, prompt = prep_audio(samples)
-            sa = samples.copy()
-            def _a(): asr_result[0] = asr_run(sa)
-            asr_thread = threading.Thread(target=_a); asr_thread.start()
+            if known_user_text is not None:
+                user_text = known_user_text
+            else:
+                sa = samples.copy()
+                def _a(): asr_result[0] = asr_run(sa)
+                asr_thread = threading.Thread(target=_a); asr_thread.start()
     if image_b64:
         pixel_values = prep_image(image_b64)
         m = M['model']
@@ -434,7 +443,7 @@ def chat():
 
 @sock.route('/ws/realtime')
 def realtime(ws):
-    session = RealtimeSession(M['vad_path'])
+    session = RealtimeSession(M['vad_path'], threshold=VAD_THRESHOLD, pre_speech_ms=VAD_PRE_SPEECH_MS)
     q = queue.Queue(); alive = [True]; state = {'history': [], 'image': None}
     n_hist = M['cfg'].max_history_turns
 
@@ -465,9 +474,11 @@ def realtime(ws):
         while alive[0]:
             try:
                 data = ws.receive(timeout=1)
-                if data is None: alive[0] = False; break
+                if data is None: continue
                 q.put(data)
-            except: alive[0] = False; break
+            except Exception as e:
+                print(f'Realtime WebSocket closed: {type(e).__name__}: {e}')
+                alive[0] = False; break
 
     threading.Thread(target=recv_loop, daemon=True).start()
     try:
@@ -488,14 +499,50 @@ def realtime(ws):
 
             session.generating = True
             audio = session.get_audio()
-            ws.send(json.dumps({'type': 'generating'}))
-            audio_inputs, audio_lens, pixel_values, prompt, user_text, asr_th, asr_res = prepare_turn(
-                '', audio, state['image'], do_asr_for_image=True)
+            image = state['image']
             if state['image']: state['image'] = None
+            ws.send(json.dumps({'type': 'transcribing'}))
+            asr_started = time.perf_counter()
+            try:
+                user_text = asr_run(audio)
+            except Exception as e:
+                user_text = ''
+                print(f'Realtime ASR failed: {type(e).__name__}: {e}')
+            asr_ms = (time.perf_counter() - asr_started) * 1000
+            if user_text: ws.send(json.dumps({'type': 'user_prompt', 'content': user_text}))
+
+            if poll_interrupt() or session.interrupt:
+                ws.send(json.dumps({'type': 'done', 'interrupted': True, 'asr_ms': round(asr_ms, 1)}))
+                session.generating = False; session.interrupt = False
+                continue
+
+            ws.send(json.dumps({'type': 'generating', 'asr_ms': round(asr_ms, 1)}))
+            audio_inputs, audio_lens, pixel_values, prompt, user_text, asr_th, asr_res = prepare_turn(
+                '', audio, image, do_asr_for_image=True, known_user_text=user_text)
             x = build_ids(prompt, state['history'])
             va_rt = voice_args(state.get('voice', 'default'))
 
-            frames, full_text, interrupted, asr_sent = [], '', False, False
+            frames, full_text, interrupted, asr_sent = [], '', False, True
+            generation_started = time.perf_counter()
+            first_pcm_at = last_pcm_at = None
+            pcm_audio_ms, pcm_sequence = 0.0, 0
+
+            def send_pcm(pcm, decode_ms):
+                nonlocal first_pcm_at, last_pcm_at, pcm_audio_ms, pcm_sequence
+                now = time.perf_counter()
+                if first_pcm_at is None: first_pcm_at = now
+                last_pcm_at = now
+                pcm_sequence += 1
+                pcm_audio_ms += len(pcm) / 2 / 24000 * 1000
+                ws.send(json.dumps({
+                    'type': 'pcm',
+                    'data': base64.b64encode(pcm).decode(),
+                    'sequence': pcm_sequence,
+                    'audio_ms': round(pcm_audio_ms, 1),
+                    'elapsed_ms': round((now - generation_started) * 1000, 1),
+                    'decode_ms': round(decode_ms, 1),
+                }))
+
             for y, af in run_generate(x, audio_inputs, audio_lens, pixel_values,
                                        max_new_tokens=512, temperature=0.7, **va_rt):
                 if poll_interrupt() or session.interrupt: interrupted = True; break
@@ -509,11 +556,15 @@ def realtime(ws):
                         ws.send(json.dumps({'type': 'text', 'content': ans[len(full_text):]})); full_text = ans
                 if af:
                     frames.append(af)
-                    for pcm in stream_pcm(frames):
-                        ws.send(json.dumps({'type': 'pcm', 'data': base64.b64encode(pcm).decode()}))
+                    decode_started = time.perf_counter()
+                    pcm_chunks = list(stream_pcm(frames))
+                    decode_ms = (time.perf_counter() - decode_started) * 1000
+                    for pcm in pcm_chunks: send_pcm(pcm, decode_ms)
             if not interrupted:
-                for pcm in stream_pcm(frames, flush=True):
-                    ws.send(json.dumps({'type': 'pcm', 'data': base64.b64encode(pcm).decode()}))
+                decode_started = time.perf_counter()
+                pcm_chunks = list(stream_pcm(frames, flush=True))
+                decode_ms = (time.perf_counter() - decode_started) * 1000
+                for pcm in pcm_chunks: send_pcm(pcm, decode_ms)
             if asr_th and not asr_sent:
                 asr_th.join(); user_text = asr_res[0] or user_text
                 if user_text: ws.send(json.dumps({'type': 'user_prompt', 'content': user_text}))
@@ -521,7 +572,17 @@ def realtime(ws):
                 if user_text: state['history'].append({'role': 'user', 'content': user_text})
                 if full_text: state['history'].append({'role': 'assistant', 'content': full_text})
                 state['history'] = state['history'][-n_hist:]
-            ws.send(json.dumps({'type': 'done', 'interrupted': interrupted or session.interrupt}))
+            generation_ms = (time.perf_counter() - generation_started) * 1000
+            delivery_ms = ((last_pcm_at - first_pcm_at) * 1000) if first_pcm_at is not None and last_pcm_at is not None else 0
+            stats = {
+                'asr_ms': round(asr_ms, 1),
+                'generation_ms': round(generation_ms, 1),
+                'delivery_ms': round(delivery_ms, 1),
+                'audio_ms': round(pcm_audio_ms, 1),
+                'pcm_chunks': pcm_sequence,
+            }
+            print(f'Realtime turn: {stats}')
+            ws.send(json.dumps({'type': 'done', 'interrupted': interrupted or session.interrupt, **stats}))
             session.generating = False; session.interrupt = False
     finally:
         alive[0] = False
@@ -558,6 +619,7 @@ def init_model(args):
         M['campplus'], M['mel_fn'] = None, None
         print(f'CAM++ load failed: {e}')
     M['vad_path'] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model', 'vad', 'silero_vad.onnx')
+    print(f'VAD config: threshold={VAD_THRESHOLD}, pre_speech_ms={VAD_PRE_SPEECH_MS}')
     spk_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model', 'speaker')
     for fn, group in [('voices.pt', 'builtin'), ('voices_unseen.pt', 'unseen'), (CLONE_FILE, 'manual')]:
         fp = os.path.join(spk_dir, fn)

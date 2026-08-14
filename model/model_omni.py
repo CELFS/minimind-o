@@ -413,15 +413,16 @@ class SileroVAD:
 
 
 class RealtimeSession:
-    def __init__(self, vad_path, sr=16000, threshold=0.8, min_speech_ms=128, min_silence_ms=800):
+    def __init__(self, vad_path, sr=16000, threshold=0.7, min_speech_ms=128, min_silence_ms=800, pre_speech_ms=512):
         self.vad, self.sr, self.threshold = SileroVAD(vad_path), sr, threshold
         self.min_speech, self.min_silence = int(sr * min_speech_ms / 1000), int(sr * min_silence_ms / 1000)
+        self.pre_speech_samples = int(sr * pre_speech_ms / 1000)
         self.reset()
 
     def reset(self):
         self.vad.reset()
         self.buffer, self.ring, self.speaking, self.generating, self.interrupt = [], [], False, False, False
-        self.speech_samples = self.silence_samples = self.tail_silence = 0
+        self.speech_samples = self.silence_samples = self.tail_silence = self.ring_samples = 0
 
     def push_chunk(self, chunk, W=1024):
         for i in range(0, max(len(chunk), 1), W):
@@ -437,6 +438,7 @@ class RealtimeSession:
                     self.speaking = True
                     self.buffer = self.ring + self.buffer
                     self.ring = []
+                    self.ring_samples = 0
                 if self.generating and self.speaking:
                     self.interrupt = True
                     return 'interrupt'
@@ -453,7 +455,10 @@ class RealtimeSession:
                 if self.speech_samples > 0:
                     self.buffer.clear()
                 self.speech_samples = 0
-                self.ring = [w]
+                self.ring.append(w)
+                self.ring_samples += len(w)
+                while self.ring and self.ring_samples > self.pre_speech_samples:
+                    self.ring_samples -= len(self.ring.pop(0))
         return 'listening'
 
     def get_audio(self):
