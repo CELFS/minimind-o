@@ -1,0 +1,17 @@
+.git
+.conda-env
+.cache
+**/.cache
+__pycache__
+*.pyc
+.DS_Store
+.env
+dataset
+images
+scripts
+out
+model/speaker/*.pt
+model/vad/*.onnx
+README.md
+README_en.md
+CODE_OF_CONDUCT.md

@@ -1,0 +1,15 @@
+.git
+.conda-env
+.cache
+**/.cache
+__pycache__
+*.pyc
+.DS_Store
+.env
+dataset
+images
+scripts
+out
+README.md
+README_en.md
+CODE_OF_CONDUCT.md
